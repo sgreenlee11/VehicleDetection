@@ -1,0 +1,43 @@
+# Default configuration for vehicle detector
+model: yolov8n.pt
+confidence: 0.25
+max_fps: 30           # Cap processing to this FPS (after stride). Set 0 to disable
+stride_frames: 2      # Sample every Nth frame (>=1). Lower for more aggressive sampling.
+iou: 0.5
+device: auto          # 'auto', 'cpu', 'cuda', or index like 0
+imgsz: 640            # YOLO inference image size
+classes: [2]      # COCO: car(2), bus(5), truck(7). Excludes motorcycle by default
+tracking:
+  max_age: 15
+  n_init: 1
+  max_iou_distance: 0.7
+  max_cosine_distance: 0.2
+  nn_budget: 100
+color_filter:
+  mode: hsv
+  white_ratio_threshold: 0.15
+  enabled: true
+  # Pearl white range in Lab space; tweak as needed
+  lab:
+    L_min: 70
+    L_max: 100
+    a_min: -5
+    a_max: 8
+    b_min: -5
+    b_max: 15
+  min_box_area: 1000     # Skip tiny boxes
+  erosion: 0
+sedan_only: false        # If true, use heuristic shape ratio filter; proper classifier not bundled
+segment_export:
+  pre_seconds: 5
+  post_seconds: 5
+  codec: libx264
+  crf: 23
+  preset: veryfast
+  reencode: false   # If false, tries stream copy; falls back to reencode if not possible
+stills:
+  enabled: true           # Export one representative still frame per matching track
+  annotate: true          # Draw bbox and track id on the still frame
+  save_crop: false        # Also save a cropped vehicle image
+  edge_margin: 8          # Pixels from edge considered incomplete
+  out_dirname: stills     # Subdirectory name for stills
