@@ -7,6 +7,7 @@ iou: 0.5
 device: auto          # 'auto', 'cpu', 'cuda', or index like 0
 imgsz: 640            # YOLO inference image size
 classes: [2]      # COCO: car(2), bus(5), truck(7). Excludes motorcycle by default
+batch_size: 8
 tracking:
   max_age: 15
   n_init: 1
@@ -41,3 +42,4 @@ stills:
   save_crop: false        # Also save a cropped vehicle image
   edge_margin: 8          # Pixels from edge considered incomplete
   out_dirname: stills     # Subdirectory name for stills
+  global_dir: all_stills
