@@ -48,6 +48,7 @@ class VideoAnalyzer:
         self.seg_cfg = self.cfg.get("segment_export", {})
         self.max_fps = float(self.cfg.get("max_fps", 0))
         self.stride_frames = max(1, int(self.cfg.get("stride_frames", 2)))
+        self.batch_size = int(self.cfg.get("batch_size", 1))  # Default 1, user can override
 
     def frame_should_process(self, frame_idx: int) -> bool:
         return frame_idx % self.stride_frames == 0
@@ -66,6 +67,7 @@ class VideoAnalyzer:
         aspect = w / h
         return 1.2 <= aspect <= 3.5
 
+
     def analyze_video(self, video_path: str, output_dir: str) -> Dict:
         start_time = time.time()
         cap = cv2.VideoCapture(video_path)
@@ -80,12 +82,20 @@ class VideoAnalyzer:
         segments: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
         track_last_seen: Dict[int, int] = {}
         track_first_seen: Dict[int, int] = {}
-        # Track best still per tid: store (score, frame_bgr, bbox, frame_idx)
         best_still: Dict[int, Tuple[float, np.ndarray, Tuple[int, int, int, int], int]] = {}
         frame_idx = -1
         processed_idx = -1
         results = []
         debug_rejects_saved = 0
+
+        batch_frames = []
+        batch_indices = []
+
+        def process_batch(frames, indices):
+            if not frames:
+                return []
+            dets_list = self.detector.model.predict(source=frames, classes=self.detector.classes, conf=self.detector.conf, iou=self.detector.iou, verbose=False, device=self.detector.device, imgsz=self.detector.imgsz) if len(frames) > 1 else [self.detector.model.predict(source=frames[0], classes=self.detector.classes, conf=self.detector.conf, iou=self.detector.iou, verbose=False, device=self.detector.device, imgsz=self.detector.imgsz)[0]]
+            return dets_list
 
         while True:
             ret, frame = cap.read()
@@ -95,68 +105,134 @@ class VideoAnalyzer:
             if frame_idx % vid_stride != 0:
                 continue
             processed_idx += 1
+            batch_frames.append(frame)
+            batch_indices.append(frame_idx)
+            if len(batch_frames) < self.batch_size:
+                continue
 
-            detections = self.detector.infer(frame)
-            tracks = self.tracker.update(detections, frame)
-
-            for tid, bbox in tracks:
-                x1, y1, x2, y2 = bbox
-                # Optional sedan-only heuristic
-                if self.sedan_only and not self.sedan_shape_heuristic((x1, y1, x2, y2)):
-                    continue
-                # Color filter (only if enabled). Uses check_white which supports Lab or HSV.
-                if self.color_cfg.get("enabled", True):
-                    ok, ratio, crop, mask = check_white(frame, (x1, y1, x2, y2), self.color_cfg)
-                    if not ok:
-                        # Optional debug saving of rejects
-                        dbg_dir = self.color_cfg.get("debug_dir")
-                        if dbg_dir:
-                            try:
-                                Path(dbg_dir).mkdir(parents=True, exist_ok=True)
-                                max_dbg = int(self.color_cfg.get("debug_max", 30))
-                                if debug_rejects_saved < max_dbg and crop is not None:
-                                    fn_base = f"rej_f{frame_idx}_tid{tid}_r{ratio:.2f}"
-                                    cv2.imwrite(str(Path(dbg_dir) / f"{fn_base}_crop.jpg"), crop)
-                                    if mask is not None:
-                                        cv2.imwrite(str(Path(dbg_dir) / f"{fn_base}_mask.png"), mask)
-                                    debug_rejects_saved += 1
-                            except Exception:
-                                pass
+            dets_list = process_batch(batch_frames, batch_indices)
+            for det_idx, det in enumerate(dets_list):
+                cur_frame = batch_frames[det_idx]
+                cur_idx = batch_indices[det_idx]
+                detections = []
+                if det.boxes is not None:
+                    for b in det.boxes:
+                        xyxy = b.xyxy[0].cpu().numpy().astype(int)
+                        conf = float(b.conf[0].cpu().numpy()) if b.conf is not None else 0.0
+                        cls = int(b.cls[0].cpu().numpy()) if b.cls is not None else -1
+                        detections.append((xyxy, conf, cls))
+                tracks = self.tracker.update(detections, cur_frame)
+                for tid, bbox in tracks:
+                    x1, y1, x2, y2 = bbox
+                    if self.sedan_only and not self.sedan_shape_heuristic((x1, y1, x2, y2)):
                         continue
+                    if self.color_cfg.get("enabled", True):
+                        ok, ratio, crop, mask = check_white(cur_frame, (x1, y1, x2, y2), self.color_cfg)
+                        if not ok:
+                            dbg_dir = self.color_cfg.get("debug_dir")
+                            if dbg_dir:
+                                try:
+                                    Path(dbg_dir).mkdir(parents=True, exist_ok=True)
+                                    max_dbg = int(self.color_cfg.get("debug_max", 30))
+                                    if debug_rejects_saved < max_dbg and crop is not None:
+                                        fn_base = f"rej_f{cur_idx}_tid{tid}_r{ratio:.2f}"
+                                        cv2.imwrite(str(Path(dbg_dir) / f"{fn_base}_crop.jpg"), crop)
+                                        if mask is not None:
+                                            cv2.imwrite(str(Path(dbg_dir) / f"{fn_base}_mask.png"), mask)
+                                        debug_rejects_saved += 1
+                                except Exception:
+                                    pass
+                            continue
+                    if tid not in track_first_seen:
+                        track_first_seen[tid] = cur_idx
+                    track_last_seen[tid] = cur_idx
+                    results.append({
+                        "frame": cur_idx,
+                        "tid": tid,
+                        "bbox": bbox,
+                        "time_sec": cur_idx / fps,
+                    })
+                    stills_cfg = self.cfg.get("stills", {"enabled": False})
+                    if stills_cfg.get("enabled", False):
+                        H, W = cur_frame.shape[:2]
+                        cx = (x1 + x2) / 2.0
+                        cy = (y1 + y2) / 2.0
+                        dx = abs(cx - W / 2) / (W / 2)
+                        dy = abs(cy - H / 2) / (H / 2)
+                        center_penalty = dx + dy
+                        margin = int(stills_cfg.get("edge_margin", 8))
+                        complete = (x1 >= margin and y1 >= margin and x2 <= W - margin and y2 <= H - margin)
+                        completeness_bonus = 0.2 if complete else 0.0
+                        area = (x2 - x1) * (y2 - y1)
+                        norm_area = area / float(W * H)
+                        score = completeness_bonus + (0.5 * norm_area) + (0.5 * (1.0 - min(1.0, center_penalty)))
+                        prev = best_still.get(tid)
+                        if prev is None or score > prev[0]:
+                            best_still[tid] = (score, cur_frame.copy(), (x1, y1, x2, y2), cur_idx)
+            batch_frames = []
+            batch_indices = []
 
-                # Mark segment membership
-                if tid not in track_first_seen:
-                    track_first_seen[tid] = frame_idx
-                track_last_seen[tid] = frame_idx
-
-                results.append({
-                    "frame": frame_idx,
-                    "tid": tid,
-                    "bbox": bbox,
-                    "time_sec": frame_idx / fps,
-                })
-
-                # Still frame candidate scoring
-                stills_cfg = self.cfg.get("stills", {"enabled": False})
-                if stills_cfg.get("enabled", False):
-                    # Score: prefer centered and complete within margins
-                    H, W = frame.shape[:2]
-                    cx = (x1 + x2) / 2.0
-                    cy = (y1 + y2) / 2.0
-                    dx = abs(cx - W / 2) / (W / 2)
-                    dy = abs(cy - H / 2) / (H / 2)
-                    center_penalty = dx + dy  # smaller is better
-                    margin = int(stills_cfg.get("edge_margin", 8))
-                    complete = (x1 >= margin and y1 >= margin and x2 <= W - margin and y2 <= H - margin)
-                    completeness_bonus = 0.2 if complete else 0.0
-                    area = (x2 - x1) * (y2 - y1)
-                    norm_area = area / float(W * H)
-                    # Higher score is better
-                    score = completeness_bonus + (0.5 * norm_area) + (0.5 * (1.0 - min(1.0, center_penalty)))
-                    prev = best_still.get(tid)
-                    if prev is None or score > prev[0]:
-                        best_still[tid] = (score, frame.copy(), (x1, y1, x2, y2), frame_idx)
-
+        # Process any remaining frames in the last batch
+        if batch_frames:
+            dets_list = process_batch(batch_frames, batch_indices)
+            for det_idx, det in enumerate(dets_list):
+                cur_frame = batch_frames[det_idx]
+                cur_idx = batch_indices[det_idx]
+                detections = []
+                if det.boxes is not None:
+                    for b in det.boxes:
+                        xyxy = b.xyxy[0].cpu().numpy().astype(int)
+                        conf = float(b.conf[0].cpu().numpy()) if b.conf is not None else 0.0
+                        cls = int(b.cls[0].cpu().numpy()) if b.cls is not None else -1
+                        detections.append((xyxy, conf, cls))
+                tracks = self.tracker.update(detections, cur_frame)
+                for tid, bbox in tracks:
+                    x1, y1, x2, y2 = bbox
+                    if self.sedan_only and not self.sedan_shape_heuristic((x1, y1, x2, y2)):
+                        continue
+                    if self.color_cfg.get("enabled", True):
+                        ok, ratio, crop, mask = check_white(cur_frame, (x1, y1, x2, y2), self.color_cfg)
+                        if not ok:
+                            dbg_dir = self.color_cfg.get("debug_dir")
+                            if dbg_dir:
+                                try:
+                                    Path(dbg_dir).mkdir(parents=True, exist_ok=True)
+                                    max_dbg = int(self.color_cfg.get("debug_max", 30))
+                                    if debug_rejects_saved < max_dbg and crop is not None:
+                                        fn_base = f"rej_f{cur_idx}_tid{tid}_r{ratio:.2f}"
+                                        cv2.imwrite(str(Path(dbg_dir) / f"{fn_base}_crop.jpg"), crop)
+                                        if mask is not None:
+                                            cv2.imwrite(str(Path(dbg_dir) / f"{fn_base}_mask.png"), mask)
+                                        debug_rejects_saved += 1
+                                except Exception:
+                                    pass
+                            continue
+                    if tid not in track_first_seen:
+                        track_first_seen[tid] = cur_idx
+                    track_last_seen[tid] = cur_idx
+                    results.append({
+                        "frame": cur_idx,
+                        "tid": tid,
+                        "bbox": bbox,
+                        "time_sec": cur_idx / fps,
+                    })
+                    stills_cfg = self.cfg.get("stills", {"enabled": False})
+                    if stills_cfg.get("enabled", False):
+                        H, W = cur_frame.shape[:2]
+                        cx = (x1 + x2) / 2.0
+                        cy = (y1 + y2) / 2.0
+                        dx = abs(cx - W / 2) / (W / 2)
+                        dy = abs(cy - H / 2) / (H / 2)
+                        center_penalty = dx + dy
+                        margin = int(stills_cfg.get("edge_margin", 8))
+                        complete = (x1 >= margin and y1 >= margin and x2 <= W - margin and y2 <= H - margin)
+                        completeness_bonus = 0.2 if complete else 0.0
+                        area = (x2 - x1) * (y2 - y1)
+                        norm_area = area / float(W * H)
+                        score = completeness_bonus + (0.5 * norm_area) + (0.5 * (1.0 - min(1.0, center_penalty)))
+                        prev = best_still.get(tid)
+                        if prev is None or score > prev[0]:
+                            best_still[tid] = (score, cur_frame.copy(), (x1, y1, x2, y2), cur_idx)
         cap.release()
 
         # Build segments for each track
@@ -208,6 +284,19 @@ class VideoAnalyzer:
             still_dir.mkdir(parents=True, exist_ok=True)
             if stills_cfg.get("save_crop", False):
                 crop_dir.mkdir(parents=True, exist_ok=True)
+
+            # Global stills directory (flat corpus)
+            global_dir = None
+            global_crop_dir = None
+            global_dirname = stills_cfg.get("global_dir")
+            if global_dirname:
+                global_dir = Path(output_dir) / global_dirname
+                global_dir.mkdir(parents=True, exist_ok=True)
+                if stills_cfg.get("save_crop", False):
+                    global_crop_dir = global_dir / "crops"
+                    global_crop_dir.mkdir(parents=True, exist_ok=True)
+
+            video_stem = Path(video_path).stem
             for tid, (score, img, bbox, fidx) in best_still.items():
                 x1, y1, x2, y2 = bbox
                 img_to_save = img.copy()
@@ -220,14 +309,23 @@ class VideoAnalyzer:
                     tid_str = f"{tid_int:04d}"
                 except Exception:
                     tid_str = str(tid)
-                still_path = still_dir / f"still_{tid_str}_f{fidx}.jpg"
+                still_fn = f"still_{tid_str}_f{fidx}.jpg"
+                still_path = still_dir / still_fn
                 cv2.imwrite(str(still_path), img_to_save)
+                # Also save to global stills dir if enabled
+                if global_dir is not None:
+                    global_still_fn = f"{video_stem}_{still_fn}"
+                    cv2.imwrite(str(global_dir / global_still_fn), img_to_save)
                 crop_path = None
                 if stills_cfg.get("save_crop", False):
                     crop = img[y1:y2, x1:x2]
-                    crop_path = crop_dir / f"still_{tid_str}_f{fidx}_crop.jpg"
+                    crop_fn = f"still_{tid_str}_f{fidx}_crop.jpg"
+                    crop_path = crop_dir / crop_fn
                     if crop.size > 0:
                         cv2.imwrite(str(crop_path), crop)
+                        if global_crop_dir is not None:
+                            global_crop_fn = f"{video_stem}_{crop_fn}"
+                            cv2.imwrite(str(global_crop_dir / global_crop_fn), crop)
                 still_records.append({
                     "track_id": tid,
                     "frame": fidx,

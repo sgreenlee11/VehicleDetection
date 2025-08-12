@@ -12,9 +12,18 @@ def crop_and_resize(frame: np.ndarray, bbox_xyxy: Tuple[int, int, int, int], max
     if crop.size == 0:
         return crop
     ch, cw = crop.shape[:2]
-    scale = min(max_side / max(ch, cw), 1.0)
+    # Compute scale to limit the largest side to max_side (downscale only)
+    longest = max(ch, cw)
+    if longest <= 0:
+        return crop
+    scale = min(max_side / float(longest), 1.0)
     if scale < 1.0:
-        crop = cv2.resize(crop, (int(cw * scale), int(ch * scale)), interpolation=cv2.INTER_AREA)
+        # Ensure target size is at least 1x1 to avoid OpenCV assertion failures on extreme aspect ratios
+        new_w = max(1, int(round(cw * scale)))
+        new_h = max(1, int(round(ch * scale)))
+        # Only resize if it actually changes dimensions
+        if new_w != cw or new_h != ch:
+            crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
     return crop
 
 
