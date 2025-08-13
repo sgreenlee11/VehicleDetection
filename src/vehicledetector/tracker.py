@@ -25,7 +25,10 @@ class MultiObjectTracker:
         in_dets = []
         for (xyxy, conf, cls) in detections:
             x1, y1, x2, y2 = map(int, xyxy)
-            in_dets.append(([x1, y1, x2, y2], conf, str(cls)))
+            # DeepSort default expects TLWH (x, y, w, h)
+            w = max(1, x2 - x1)
+            h = max(1, y2 - y1)
+            in_dets.append(([x1, y1, w, h], conf, str(cls)))
         tracks = self.tracker.update_tracks(in_dets, frame=frame)
         results = []
         for t in tracks:

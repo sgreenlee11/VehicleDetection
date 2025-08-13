@@ -45,6 +45,11 @@ def main():
     # Color filter knobs
     ap.add_argument("--min-box-area", type=int, default=None, help="Minimum bbox area for color check (px)")
     ap.add_argument("--white-ratio-thr", type=float, default=None, help="White mask ratio threshold [0-1]")
+    ap.add_argument("--min-box-area-pct", type=float, default=None, help="Minimum bbox area as fraction of frame area (e.g., 0.001)")
+    ap.add_argument("--color-enabled", type=lambda x: str(x).lower() in {"1","true","yes"}, default=None, help="Enable/disable color filter")
+    ap.add_argument("--color-mode", choices=["hsv","lab"], default=None, help="Color filter space")
+    ap.add_argument("--color-debug-dir", default=None, help="Directory to dump rejected crops/masks for tuning")
+    ap.add_argument("--color-debug-max", type=int, default=None, help="Max rejected samples to save")
     ap.add_argument("--report", default="summary.csv", help="CSV filename under output for overall report")
     args = ap.parse_args()
 
@@ -107,6 +112,16 @@ def main():
         analyzer.cfg.setdefault("color_filter", {})["min_box_area"] = int(args.min_box_area)
     if args.white_ratio_thr is not None:
         analyzer.cfg.setdefault("color_filter", {})["white_ratio_threshold"] = float(args.white_ratio_thr)
+    if args.min_box_area_pct is not None:
+        analyzer.cfg.setdefault("color_filter", {})["min_box_area_pct"] = float(args.min_box_area_pct)
+    if args.color_enabled is not None:
+        analyzer.cfg.setdefault("color_filter", {})["enabled"] = bool(args.color_enabled)
+    if args.color_mode is not None:
+        analyzer.cfg.setdefault("color_filter", {})["mode"] = str(args.color_mode)
+    if args.color_debug_dir is not None:
+        analyzer.cfg.setdefault("color_filter", {})["debug_dir"] = str(args.color_debug_dir)
+    if args.color_debug_max is not None:
+        analyzer.cfg.setdefault("color_filter", {})["debug_max"] = int(args.color_debug_max)
 
     videos = collect_videos(args.input, recurse=True)
     Path(args.output).mkdir(parents=True, exist_ok=True)
