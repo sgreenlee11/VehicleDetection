@@ -71,13 +71,18 @@ def white_mask_hsv(crop_bgr: np.ndarray, hsv_cfg: Dict[str, Any], erosion: int =
 
 def check_white(frame: np.ndarray, bbox_xyxy: Tuple[int, int, int, int], cfg: Dict[str, Any]) -> Tuple[bool, float, Optional[np.ndarray], Optional[np.ndarray]]:
     # Returns: (is_white, white_ratio, crop_bgr, mask)
+    # Absolute minimum area in pixels and/or percentage of full frame area
     min_area = int(cfg.get("min_box_area", 1000))
+    min_area_pct = float(cfg.get("min_box_area_pct", 0.0))
     mode = str(cfg.get("mode", "lab")).lower()
     ratio_thr = float(cfg.get("white_ratio_threshold", 0.25))
     erosion = int(cfg.get("erosion", 0))
 
     x1, y1, x2, y2 = bbox_xyxy
-    if (x2 - x1) * (y2 - y1) < min_area:
+    H, W = frame.shape[:2]
+    frame_area = max(1, H * W)
+    eff_min_area = max(min_area, int(round(min_area_pct * frame_area))) if min_area_pct > 0 else min_area
+    if (x2 - x1) * (y2 - y1) < eff_min_area:
         return False, 0.0, None, None
     crop = crop_and_resize(frame, bbox_xyxy)
     if crop.size == 0:

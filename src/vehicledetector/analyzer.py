@@ -1,72 +1,93 @@
 from __future__ import annotations
-import cv2
-import time
 import os
+import time
+from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-import yaml
+from typing import Any, Dict, List, Optional, Tuple
+
+import cv2
 import numpy as np
+import yaml
+
 from .detector import YoloDetector
 from .tracker import MultiObjectTracker
-from .color_utils import is_pearl_white, check_white
-from .ffmpeg_export import export_segment, have_ffmpeg
-from collections import defaultdict
-
-
-def load_config(path: Optional[str]) -> dict:
-    base = Path(__file__).with_name("config.yaml")
-    cfg = {}
-    if base.exists():
-        cfg = yaml.safe_load(base.read_text())
-    if path and Path(path).exists():
-        user = yaml.safe_load(Path(path).read_text())
-        cfg.update(user)
-    return cfg
+from .color_utils import check_white
+# Segment export removed per user request; keep module focused on stills only
 
 
 class VideoAnalyzer:
-    def __init__(self, config_path: Optional[str] = None):
-        self.cfg = load_config(config_path)
+    def __init__(self, config_path: Optional[str] = None, config: Optional[Dict[str, Any]] = None):
+        # Load configuration
+        if config is not None:
+            self.cfg = config
+        else:
+            if config_path is None:
+                # Default to config.yaml alongside this module if present
+                default_cfg = Path(__file__).with_name("config.yaml")
+                config_path = str(default_cfg) if default_cfg.exists() else None
+            self.cfg = {}
+            if config_path and Path(config_path).exists():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    self.cfg = yaml.safe_load(f) or {}
+
+        # Detector
         self.detector = YoloDetector(
-            model_path=self.cfg.get("model", "yolov8n.pt"),
-            classes=self.cfg.get("classes", [2, 3, 5, 7]),
-            conf=float(self.cfg.get("confidence", 0.25)),
-            iou=float(self.cfg.get("iou", 0.5)),
-            device=self.cfg.get("device", "auto"),
-            imgsz=int(self.cfg.get("imgsz", 640)),
+            self.cfg.get("model", "yolov8n.pt"),
+            self.cfg.get("classes"),
+            self.cfg.get("confidence", 0.25),
+            self.cfg.get("iou", 0.5),
+            self.cfg.get("device", "auto"),
+            self.cfg.get("imgsz", 640),
         )
-        tcfg = self.cfg.get("tracking", {})
+
+        # Tracker
+        # Accept both 'tracker' and legacy 'tracking' key from YAML
+        tracker_cfg = self.cfg.get("tracker", {}) or self.cfg.get("tracking", {})
         self.tracker = MultiObjectTracker(
-            max_age=int(tcfg.get("max_age", 30)),
-            n_init=int(tcfg.get("n_init", 3)),
-            max_iou_distance=float(tcfg.get("max_iou_distance", 0.7)),
-            max_cosine_distance=float(tcfg.get("max_cosine_distance", 0.2)),
-            nn_budget=int(tcfg.get("nn_budget", 100)),
+            max_age=int(tracker_cfg.get("max_age", 30)),
+            n_init=int(tracker_cfg.get("n_init", 3)),
+            max_iou_distance=float(tracker_cfg.get("max_iou_distance", 0.7)),
+            max_cosine_distance=float(tracker_cfg.get("max_cosine_distance", 0.2)),
+            nn_budget=int(tracker_cfg.get("nn_budget", 100)),
         )
+
+        # Sampling and runtime
+        self.stride_frames = int(self.cfg.get("stride_frames", 1))
+        self.max_fps = self.cfg.get("max_fps")
+        self.fps_sanity_max = float(self.cfg.get("fps_sanity_max", 240.0))
+        self.batch_size = max(1, int(self.cfg.get("batch_size", 1)))
+
+        # Behavior
         self.color_cfg = self.cfg.get("color_filter", {})
-        self.sedan_only = bool(self.cfg.get("sedan_only", False))
         self.seg_cfg = self.cfg.get("segment_export", {})
-        self.max_fps = float(self.cfg.get("max_fps", 0))
-        self.stride_frames = max(1, int(self.cfg.get("stride_frames", 2)))
-        self.batch_size = int(self.cfg.get("batch_size", 1))  # Default 1, user can override
+        self.sedan_only = bool(self.cfg.get("sedan_only", False))
 
-    def frame_should_process(self, frame_idx: int) -> bool:
-        return frame_idx % self.stride_frames == 0
-
-    def maybe_cap_fps(self, vid_fps: float) -> int:
-        if self.max_fps and vid_fps > 0:
-            stride = int(max(1, round(vid_fps / self.max_fps)))
-            return stride
-        return self.stride_frames
+    def maybe_cap_fps(self, fps: float) -> int:
+        """Compute an effective stride to respect max_fps and cap absurd FPS metadata."""
+        stride = max(1, int(self.stride_frames or 1))
+        if self.max_fps:
+            try:
+                maxfps = float(self.max_fps)
+                if fps > maxfps and maxfps > 0:
+                    stride = max(stride, int(max(1, round(fps / maxfps))))
+            except Exception:
+                pass
+        # Cap absurd FPS values (e.g., some AVIs report 1000fps)
+        try:
+            if fps > self.fps_sanity_max and self.fps_sanity_max > 0:
+                stride = max(stride, int(max(1, round(fps / self.fps_sanity_max))))
+        except Exception:
+            pass
+        return max(1, stride)
 
     def sedan_shape_heuristic(self, bbox: Tuple[int, int, int, int]) -> bool:
-        # Rough heuristic: sedans tend to have width>height and moderate aspect between 1.2 and 3.5
         x1, y1, x2, y2 = bbox
         w = max(1, x2 - x1)
         h = max(1, y2 - y1)
-        aspect = w / h
-        return 1.2 <= aspect <= 3.5
-
+        ar = w / float(h)
+        area = w * h
+        min_area = int(self.color_cfg.get("min_box_area", 1000))
+        return (area >= min_area) and (1.2 <= ar <= 5.0)
 
     def analyze_video(self, video_path: str, output_dir: str) -> Dict:
         start_time = time.time()
@@ -79,48 +100,73 @@ class VideoAnalyzer:
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-        segments: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
         track_last_seen: Dict[int, int] = {}
         track_first_seen: Dict[int, int] = {}
         best_still: Dict[int, Tuple[float, np.ndarray, Tuple[int, int, int, int], int]] = {}
         frame_idx = -1
         processed_idx = -1
-        results = []
+        results: List[Dict[str, Any]] = []
         debug_rejects_saved = 0
+        # Diagnostics
+        frames_read = 0
+        frames_processed = 0
+        raw_detections_total = 0
+        color_pass_total = 0
+        color_reject_total = 0
+        tracks_confirmed_total = 0
 
-        batch_frames = []
-        batch_indices = []
-
-        def process_batch(frames, indices):
-            if not frames:
-                return []
-            dets_list = self.detector.model.predict(source=frames, classes=self.detector.classes, conf=self.detector.conf, iou=self.detector.iou, verbose=False, device=self.detector.device, imgsz=self.detector.imgsz) if len(frames) > 1 else [self.detector.model.predict(source=frames[0], classes=self.detector.classes, conf=self.detector.conf, iou=self.detector.iou, verbose=False, device=self.detector.device, imgsz=self.detector.imgsz)[0]]
-            return dets_list
+        batch_frames: List[np.ndarray] = []
+        batch_indices: List[int] = []
 
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
+            frames_read += 1
             frame_idx += 1
             if frame_idx % vid_stride != 0:
                 continue
             processed_idx += 1
+            frames_processed += 1
             batch_frames.append(frame)
             batch_indices.append(frame_idx)
             if len(batch_frames) < self.batch_size:
                 continue
 
-            dets_list = process_batch(batch_frames, batch_indices)
+            # Run batch prediction
+            if len(batch_frames) > 1:
+                dets_list = self.detector.model.predict(
+                    source=batch_frames,
+                    classes=self.detector.classes,
+                    conf=self.detector.conf,
+                    iou=self.detector.iou,
+                    verbose=False,
+                    device=self.detector.device,
+                    imgsz=self.detector.imgsz,
+                )
+            else:
+                single_res = self.detector.model.predict(
+                    source=batch_frames[0],
+                    classes=self.detector.classes,
+                    conf=self.detector.conf,
+                    iou=self.detector.iou,
+                    verbose=False,
+                    device=self.detector.device,
+                    imgsz=self.detector.imgsz,
+                )
+                dets_list = [single_res[0]] if single_res else []
+
             for det_idx, det in enumerate(dets_list):
                 cur_frame = batch_frames[det_idx]
                 cur_idx = batch_indices[det_idx]
                 detections = []
-                if det.boxes is not None:
+                if getattr(det, "boxes", None) is not None:
                     for b in det.boxes:
                         xyxy = b.xyxy[0].cpu().numpy().astype(int)
                         conf = float(b.conf[0].cpu().numpy()) if b.conf is not None else 0.0
                         cls = int(b.cls[0].cpu().numpy()) if b.cls is not None else -1
                         detections.append((xyxy, conf, cls))
+                raw_detections_total += len(detections)
                 tracks = self.tracker.update(detections, cur_frame)
                 for tid, bbox in tracks:
                     x1, y1, x2, y2 = bbox
@@ -129,6 +175,7 @@ class VideoAnalyzer:
                     if self.color_cfg.get("enabled", True):
                         ok, ratio, crop, mask = check_white(cur_frame, (x1, y1, x2, y2), self.color_cfg)
                         if not ok:
+                            color_reject_total += 1
                             dbg_dir = self.color_cfg.get("debug_dir")
                             if dbg_dir:
                                 try:
@@ -143,9 +190,12 @@ class VideoAnalyzer:
                                 except Exception:
                                     pass
                             continue
+                        else:
+                            color_pass_total += 1
                     if tid not in track_first_seen:
                         track_first_seen[tid] = cur_idx
                     track_last_seen[tid] = cur_idx
+                    tracks_confirmed_total += 1
                     results.append({
                         "frame": cur_idx,
                         "tid": tid,
@@ -174,17 +224,38 @@ class VideoAnalyzer:
 
         # Process any remaining frames in the last batch
         if batch_frames:
-            dets_list = process_batch(batch_frames, batch_indices)
+            if len(batch_frames) > 1:
+                dets_list = self.detector.model.predict(
+                    source=batch_frames,
+                    classes=self.detector.classes,
+                    conf=self.detector.conf,
+                    iou=self.detector.iou,
+                    verbose=False,
+                    device=self.detector.device,
+                    imgsz=self.detector.imgsz,
+                )
+            else:
+                single_res = self.detector.model.predict(
+                    source=batch_frames[0],
+                    classes=self.detector.classes,
+                    conf=self.detector.conf,
+                    iou=self.detector.iou,
+                    verbose=False,
+                    device=self.detector.device,
+                    imgsz=self.detector.imgsz,
+                )
+                dets_list = [single_res[0]] if single_res else []
             for det_idx, det in enumerate(dets_list):
                 cur_frame = batch_frames[det_idx]
                 cur_idx = batch_indices[det_idx]
                 detections = []
-                if det.boxes is not None:
+                if getattr(det, "boxes", None) is not None:
                     for b in det.boxes:
                         xyxy = b.xyxy[0].cpu().numpy().astype(int)
                         conf = float(b.conf[0].cpu().numpy()) if b.conf is not None else 0.0
                         cls = int(b.cls[0].cpu().numpy()) if b.cls is not None else -1
                         detections.append((xyxy, conf, cls))
+                raw_detections_total += len(detections)
                 tracks = self.tracker.update(detections, cur_frame)
                 for tid, bbox in tracks:
                     x1, y1, x2, y2 = bbox
@@ -193,6 +264,7 @@ class VideoAnalyzer:
                     if self.color_cfg.get("enabled", True):
                         ok, ratio, crop, mask = check_white(cur_frame, (x1, y1, x2, y2), self.color_cfg)
                         if not ok:
+                            color_reject_total += 1
                             dbg_dir = self.color_cfg.get("debug_dir")
                             if dbg_dir:
                                 try:
@@ -207,9 +279,12 @@ class VideoAnalyzer:
                                 except Exception:
                                     pass
                             continue
+                        else:
+                            color_pass_total += 1
                     if tid not in track_first_seen:
                         track_first_seen[tid] = cur_idx
                     track_last_seen[tid] = cur_idx
+                    tracks_confirmed_total += 1
                     results.append({
                         "frame": cur_idx,
                         "tid": tid,
@@ -235,47 +310,8 @@ class VideoAnalyzer:
                             best_still[tid] = (score, cur_frame.copy(), (x1, y1, x2, y2), cur_idx)
         cap.release()
 
-        # Build segments for each track
-        pre_s = float(self.seg_cfg.get("pre_seconds", 5))
-        post_s = float(self.seg_cfg.get("post_seconds", 5))
-        codec = self.seg_cfg.get("codec", "libx264")
-        crf = int(self.seg_cfg.get("crf", 23))
-        preset = self.seg_cfg.get("preset", "veryfast")
-        reencode = bool(self.seg_cfg.get("reencode", False))
-
-        video_name = Path(video_path).stem
-        out_root = Path(output_dir) / video_name
-        seg_dir = out_root / "segments"
-        out_root.mkdir(parents=True, exist_ok=True)
-        seg_dir.mkdir(parents=True, exist_ok=True)
-
-        segment_records = []
-        for tid, start_f in track_first_seen.items():
-            end_f = track_last_seen.get(tid, start_f)
-            start_t = max(0.0, (start_f / fps) - pre_s)
-            end_t = (end_f / fps) + post_s
-            # Format tid for filename: zero-padded if int, else as string
-            try:
-                tid_int = int(tid)
-                tid_str = f"{tid_int:04d}"
-            except Exception:
-                tid_str = str(tid)
-            out_path = seg_dir / f"track_{tid_str}.mp4"
-            ok = False
-            if have_ffmpeg():
-                ok = export_segment(video_path, start_t, end_t, str(out_path), codec, crf, preset, reencode)
-            segment_records.append({
-                "track_id": tid,
-                "start_frame": start_f,
-                "end_frame": end_f,
-                "start_time": start_t,
-                "end_time": end_t,
-                "output": str(out_path),
-                "exported": bool(ok),
-            })
-
         # Export best still frames per track
-        still_records = []
+        still_records: List[Dict[str, Any]] = []
         stills_cfg = self.cfg.get("stills", {"enabled": False})
         if stills_cfg.get("enabled", False) and best_still:
             out_root = Path(output_dir) / Path(video_path).stem
@@ -349,7 +385,16 @@ class VideoAnalyzer:
             "frames": total_frames,
             "runtime_sec": runtime,
             "yolo_device": yolo_device,
+            "vid_stride": vid_stride,
+            "diagnostics": {
+                "frames_read": frames_read,
+                "frames_processed": frames_processed,
+                "raw_detections_total": raw_detections_total,
+                "color_pass_total": color_pass_total,
+                "color_reject_total": color_reject_total,
+                "tracks_confirmed_total": tracks_confirmed_total,
+            },
             "detections": results,
-            "segments": segment_records,
+            "segments": [],
             "stills": still_records,
         }

@@ -38,7 +38,13 @@ def main():
     ap.add_argument("--confidence", type=float, default=None, help="Detection confidence threshold")
     ap.add_argument("--device", default=None, help="YOLO device: auto/cpu/cuda/0/1...")
     ap.add_argument("--imgsz", type=int, default=None, help="YOLO image size")
+    ap.add_argument("--iou", type=float, default=None, help="NMS IoU threshold")
+    ap.add_argument("--classes", default=None, help="Comma-separated class IDs to detect (e.g., 2,5,7)")
+    ap.add_argument("--batch-size", type=int, default=None, help="Batch size for inference")
     ap.add_argument("--sedan-only", type=lambda x: str(x).lower() in {"1","true","yes"}, default=None)
+    # Color filter knobs
+    ap.add_argument("--min-box-area", type=int, default=None, help="Minimum bbox area for color check (px)")
+    ap.add_argument("--white-ratio-thr", type=float, default=None, help="White mask ratio threshold [0-1]")
     ap.add_argument("--report", default="summary.csv", help="CSV filename under output for overall report")
     args = ap.parse_args()
 
@@ -68,6 +74,11 @@ def main():
             analyzer.cfg.get("device", "auto"),
             analyzer.cfg.get("imgsz", 640),
         )
+    if args.iou is not None:
+        analyzer.cfg["iou"] = float(args.iou)
+        analyzer.detector = analyzer.detector.__class__(
+            analyzer.cfg.get("model"), analyzer.cfg.get("classes"), analyzer.cfg.get("confidence", 0.25), analyzer.cfg.get("iou", 0.5), analyzer.cfg.get("device", "auto"), analyzer.cfg.get("imgsz", 640)
+        )
     if args.device is not None:
         analyzer.cfg["device"] = args.device
         analyzer.detector = analyzer.detector.__class__(
@@ -78,8 +89,24 @@ def main():
         analyzer.detector = analyzer.detector.__class__(
             analyzer.cfg.get("model"), analyzer.cfg.get("classes"), analyzer.cfg.get("confidence"), analyzer.cfg.get("iou"), analyzer.cfg.get("device", "auto"), int(args.imgsz)
         )
+    if args.classes is not None:
+        try:
+            classes = [int(x) for x in str(args.classes).split(',') if x.strip() != '']
+        except Exception:
+            classes = None
+        analyzer.cfg["classes"] = classes
+        analyzer.detector = analyzer.detector.__class__(
+            analyzer.cfg.get("model"), analyzer.cfg.get("classes"), analyzer.cfg.get("confidence", 0.25), analyzer.cfg.get("iou", 0.5), analyzer.cfg.get("device", "auto"), analyzer.cfg.get("imgsz", 640)
+        )
+    if args.batch_size is not None:
+        analyzer.batch_size = max(1, int(args.batch_size))
     if args.sedan_only is not None:
         analyzer.sedan_only = bool(args.sedan_only)
+    # Color filter overrides
+    if args.min_box_area is not None:
+        analyzer.cfg.setdefault("color_filter", {})["min_box_area"] = int(args.min_box_area)
+    if args.white_ratio_thr is not None:
+        analyzer.cfg.setdefault("color_filter", {})["white_ratio_threshold"] = float(args.white_ratio_thr)
 
     videos = collect_videos(args.input, recurse=True)
     Path(args.output).mkdir(parents=True, exist_ok=True)
