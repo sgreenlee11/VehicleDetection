@@ -333,7 +333,13 @@ class VideoAnalyzer:
                     global_crop_dir.mkdir(parents=True, exist_ok=True)
 
             video_stem = Path(video_path).stem
-            for tid, (score, img, bbox, fidx) in best_still.items():
+
+            # Optional chronological sort of stills by frame index
+            items = list(best_still.items())
+            if bool(stills_cfg.get("sort_by_frame", False)):
+                items.sort(key=lambda kv: kv[1][3])  # sort by fidx
+
+            for tid, (score, img, bbox, fidx) in items:
                 x1, y1, x2, y2 = bbox
                 img_to_save = img.copy()
                 if stills_cfg.get("annotate", True):
@@ -345,7 +351,11 @@ class VideoAnalyzer:
                     tid_str = f"{tid_int:04d}"
                 except Exception:
                     tid_str = str(tid)
-                still_fn = f"still_{tid_str}_f{fidx}.jpg"
+                # Optionally prefix with frame index for filename-based chronological sorting
+                if bool(stills_cfg.get("filename_prefix_frame", False)):
+                    still_fn = f"f{fidx:07d}_still_{tid_str}.jpg"
+                else:
+                    still_fn = f"still_{tid_str}_f{fidx}.jpg"
                 still_path = still_dir / still_fn
                 cv2.imwrite(str(still_path), img_to_save)
                 # Also save to global stills dir if enabled
@@ -355,7 +365,10 @@ class VideoAnalyzer:
                 crop_path = None
                 if stills_cfg.get("save_crop", False):
                     crop = img[y1:y2, x1:x2]
-                    crop_fn = f"still_{tid_str}_f{fidx}_crop.jpg"
+                    if bool(stills_cfg.get("filename_prefix_frame", False)):
+                        crop_fn = f"f{fidx:07d}_still_{tid_str}_crop.jpg"
+                    else:
+                        crop_fn = f"still_{tid_str}_f{fidx}_crop.jpg"
                     crop_path = crop_dir / crop_fn
                     if crop.size > 0:
                         cv2.imwrite(str(crop_path), crop)
@@ -370,6 +383,22 @@ class VideoAnalyzer:
                     "image": str(still_path),
                     "crop": str(crop_path) if crop_path else None,
                 })
+
+            # Optionally write an index CSV sorted by frame for easy review
+            if bool(stills_cfg.get("write_index_csv", False)) and still_records:
+                try:
+                    import csv
+                    index_path = still_dir / "stills_index.csv"
+                    rows = sorted(still_records, key=lambda r: r.get("frame", 0))
+                    with open(index_path, "w", newline="", encoding="utf-8") as f:
+                        w = csv.writer(f)
+                        w.writerow(["frame", "track_id", "score", "image", "crop", "bbox"])
+                        for r in rows:
+                            w.writerow([
+                                r.get("frame"), r.get("track_id"), f"{r.get('score', 0.0):.4f}", r.get("image"), r.get("crop"), r.get("bbox"),
+                            ])
+                except Exception:
+                    pass
 
         runtime = time.time() - start_time
         # Try to get YOLO device string

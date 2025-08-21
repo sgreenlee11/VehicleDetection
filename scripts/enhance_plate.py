@@ -228,11 +228,90 @@ def edge_density(img: np.ndarray) -> float:
     return float(edges.mean())
 
 
+# --- Edge-mask utilities for masked deblur ---
+def edge_mask(
+    img: np.ndarray,
+    method: str = "canny",
+    canny_thr1: int = 80,
+    canny_thr2: int = 160,
+    dilate: int = 1,
+    dilate_ksize: int = 3,
+    feather: int = 3,
+    gamma_pow: float = 1.0,
+    thresh: float | None = None,
+) -> np.ndarray:
+    """Return a soft edge mask in [0,1], same HxW as input.
+    - method: 'canny' or 'sobel'
+    - canny_thr*: used when method=canny
+    - dilate: iterations of dilation with an elliptical kernel (ksize)
+    - feather: Gaussian blur radius (roughly). 0 to disable
+    - gamma_pow: raise mask to this power to adjust softness ( >1 makes edges sparser)
+    - thresh: optional threshold (0..1) after normalization to binarize before feathering
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if method.lower() == "sobel":
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        mag = cv2.magnitude(gx, gy)
+        m = mag
+    else:
+        edges = cv2.Canny(gray, int(canny_thr1), int(canny_thr2))
+        m = edges.astype(np.float32)
+
+    # Normalize to [0,1]
+    if m.dtype != np.float32:
+        m = m.astype(np.float32)
+    if m.max() > 0:
+        m = m / float(m.max())
+
+    # Optional hard threshold before feathering
+    if thresh is not None:
+        t = float(max(0.0, min(1.0, thresh)))
+        m = (m >= t).astype(np.float32)
+
+    # Dilate to expand edge regions
+    if dilate and dilate > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(1, int(dilate_ksize)), max(1, int(dilate_ksize))))
+        m = cv2.dilate((m * 255).astype(np.uint8), k, iterations=int(dilate))
+        m = m.astype(np.float32) / 255.0
+
+    # Feather (Gaussian blur)
+    if feather and feather > 0:
+        ksz = int(feather) * 2 + 1
+        m = cv2.GaussianBlur(m, (ksz, ksz), 0)
+
+    # Gamma to modulate softness
+    g = max(1e-6, float(gamma_pow))
+    m = np.power(np.clip(m, 0.0, 1.0), g)
+    return np.clip(m, 0.0, 1.0)
+
+
+def mask_blend(base: np.ndarray, deblur: np.ndarray, mask01: np.ndarray, strength: float = 1.0) -> np.ndarray:
+    """Blend deblurred image into base guided by mask (0..1), with global strength 0..1."""
+    s = float(max(0.0, min(1.0, strength)))
+    if base.shape[:2] != deblur.shape[:2]:
+        deblur = cv2.resize(deblur, (base.shape[1], base.shape[0]), interpolation=cv2.INTER_CUBIC)
+    if mask01.shape[:2] != base.shape[:2]:
+        mask01 = cv2.resize(mask01, (base.shape[1], base.shape[0]), interpolation=cv2.INTER_LINEAR)
+    m3 = np.repeat(mask01[..., None], 3, axis=2) * s
+    out = base.astype(np.float32) * (1.0 - m3) + deblur.astype(np.float32) * m3
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Iterative plate enhancement pipeline (no OCR)")
     ap.add_argument("image", type=str, help="Path to plate crop image")
     ap.add_argument("--out", type=str, default="outputs/plate-enhance", help="Output directory for intermediates")
     ap.add_argument("--auto-warp", action="store_true", help="Try to rectify perspective")
+    # Deskew variants (simple resampling) for safer outputs
+    ap.add_argument("--deskew-scales", type=str, default=None, help="Comma list of scales to export from deskew (e.g., 1.5,2,3)")
+    ap.add_argument(
+        "--deskew-interp",
+        type=str,
+        default="lanczos",
+        choices=["nearest", "linear", "cubic", "area", "lanczos"],
+        help="Interpolation for deskew resizes",
+    )
     ap.add_argument("--sr-model", type=str, default="", help="Path to dnn_superres .pb model (EDSR/ESPCN/FSRCNN/LapSRN)")
     ap.add_argument("--sr-algo", type=str, default="edsr", help="Algorithm name")
     ap.add_argument("--sr-scale", type=int, default=4, help="SR scale 2|3|4")
@@ -243,6 +322,22 @@ def main():
     ap.add_argument("--deblur-k", type=float, default=0.01, help="Wiener constant K (noise power)")
     ap.add_argument("--deblur-iters", type=int, default=15, help="Richardson–Lucy iterations")
     ap.add_argument("--deblur-auto", action="store_true", help="Auto grid-search small set of angles/lengths and pick best (focus score)")
+    ap.add_argument("--deblur-fast", action="store_true", help="Faster auto grid (smaller search + fewer RL iters)")
+    ap.add_argument("--deblur-grid-angles", type=str, default=None, help="Comma offsets added to --deblur-angle (e.g., -5,0,5)")
+    ap.add_argument("--deblur-grid-lens", type=str, default=None, help="Comma offsets added to --deblur-len (e.g., -2,0,2)")
+    ap.add_argument("--deblur-max-width", type=int, default=640, help="If image wider, temporarily downscale to this width during deblur for speed")
+    # Masked deblur options
+    ap.add_argument("--deblur-mask", action="store_true", help="Blend deblur only on edges (edge-masked deblur)")
+    ap.add_argument("--mask-method", type=str, default="canny", choices=["canny", "sobel"], help="Edge detector for mask")
+    ap.add_argument("--mask-canny-thr1", type=int, default=80, help="Canny threshold1")
+    ap.add_argument("--mask-canny-thr2", type=int, default=160, help="Canny threshold2")
+    ap.add_argument("--mask-dilate", type=int, default=1, help="Dilation iterations for edge mask")
+    ap.add_argument("--mask-dilate-ksize", type=int, default=3, help="Dilation kernel size for edge mask")
+    ap.add_argument("--mask-feather", type=int, default=3, help="Feather (Gaussian blur radius) for mask")
+    ap.add_argument("--mask-gamma", type=float, default=1.0, help="Gamma pow on mask to adjust softness (>1 sparser)")
+    ap.add_argument("--mask-thresh", type=float, default=None, help="Optional threshold (0..1) to binarize mask before feather")
+    ap.add_argument("--mask-strength", type=float, default=1.0, help="Blend strength 0..1 for masked deblur")
+    ap.add_argument("--mask-save", action="store_true", help="Save mask image for inspection")
     ap.add_argument("--denoise", type=float, default=7.0, help="fastNlMeansDenoisingColored strength (0 to skip)")
     ap.add_argument("--sharpen", type=float, default=1.0, help="Unsharp amount (0 to skip)")
     ap.add_argument("--clahe", type=float, default=2.0, help="CLAHE clip limit (0 to skip)")
@@ -266,6 +361,30 @@ def main():
     dsk = deskew(img)
     steps.append(("10_deskew", dsk))
 
+    # 1b. Optional deskew scaling variants
+    if args.deskew_scales:
+        def interp_from_name(name: str) -> int:
+            name = name.lower()
+            return {
+                "nearest": cv2.INTER_NEAREST,
+                "linear": cv2.INTER_LINEAR,
+                "cubic": cv2.INTER_CUBIC,
+                "area": cv2.INTER_AREA,
+                "lanczos": cv2.INTER_LANCZOS4,
+            }.get(name, cv2.INTER_LANCZOS4)
+
+        try:
+            scales = [float(s.strip()) for s in args.deskew_scales.split(',') if s.strip()]
+            inter = interp_from_name(args.deskew_interp)
+            for sc in scales:
+                if sc <= 0:
+                    continue
+                new_wh = (max(1, int(dsk.shape[1] * sc)), max(1, int(dsk.shape[0] * sc)))
+                dsk_res = cv2.resize(dsk, new_wh, interpolation=inter)
+                steps.append((f"15_deskew_x{sc:g}_{args.deskew_interp}", dsk_res))
+        except Exception as e:
+            print(f"[yellow]Deskew variants failed: {e}[/yellow]")
+
     # 2. Warp (optional)
     base = dsk
     if args.auto_warp:
@@ -287,35 +406,105 @@ def main():
     proc = sr_img
     if args.deblur_type != "none":
         try:
+            pre_deblur = proc.copy()
             candidates: list[tuple[str, np.ndarray, float]] = []
             if args.deblur_auto:
-                # small grid around provided angle/length
-                angle_grid = [args.deblur_angle + d for d in (-10, -5, 0, 5, 10)]
-                len_grid = [max(3, args.deblur_len + d) for d in (-4, -2, 0, 2, 4)]
+                # Build grid around provided angle/length
+                def parse_offsets(s: str | None, fallback: list[float]) -> list[float]:
+                    if not s:
+                        return fallback
+                    try:
+                        return [float(x.strip()) for x in s.split(',') if x.strip() != '']
+                    except Exception:
+                        return fallback
+
+                base_ang = float(args.deblur_angle)
+                base_len = int(args.deblur_len)
+                if args.deblur_fast:
+                    ang_offs = parse_offsets(args.deblur_grid_angles, [-5.0, 0.0, 5.0])
+                    len_offs = parse_offsets(args.deblur_grid_lens, [-2.0, 0.0, 2.0])
+                    if args.deblur_type == "rl":
+                        # reduce RL iters in fast mode
+                        args.deblur_iters = max(6, min(args.deblur_iters, 10))
+                else:
+                    ang_offs = parse_offsets(args.deblur_grid_angles, [-10.0, -5.0, 0.0, 5.0, 10.0])
+                    len_offs = parse_offsets(args.deblur_grid_lens, [-4.0, -2.0, 0.0, 2.0, 4.0])
+                angle_grid = [base_ang + d for d in ang_offs]
+                len_grid = [max(3, int(base_len + d)) for d in len_offs]
+
+                # Optional temporary downscale for speed
+                deblur_src = proc
+                orig_wh = (proc.shape[1], proc.shape[0])
+                if args.deblur_max_width and proc.shape[1] > int(args.deblur_max_width):
+                    scale = float(args.deblur_max_width) / float(proc.shape[1])
+                    new_wh = (int(proc.shape[1] * scale), int(proc.shape[0] * scale))
+                    deblur_src = cv2.resize(proc, new_wh, interpolation=cv2.INTER_AREA)
+
+                print(f"[cyan]Deblur grid[/cyan]: angles={angle_grid}, lens={len_grid} (type={args.deblur_type})")
                 for ang in angle_grid:
                     for ln in len_grid:
                         psf = motion_psf(ln, ang)
                         if args.deblur_type == "wiener":
-                            rec = wiener_deconv(proc, psf, K=float(args.deblur_k))
+                            rec_small = wiener_deconv(deblur_src, psf, K=float(args.deblur_k))
+                            # resize back if we downscaled
+                            if deblur_src is not proc:
+                                rec = cv2.resize(rec_small, orig_wh, interpolation=cv2.INTER_CUBIC)
+                            else:
+                                rec = rec_small
                             tag = f"wiener_L{ln}_A{int(ang)}_K{args.deblur_k}"
                         else:
-                            rec = richardson_lucy(proc, psf, iterations=int(args.deblur_iters))
+                            rec_small = richardson_lucy(deblur_src, psf, iterations=int(args.deblur_iters))
+                            if deblur_src is not proc:
+                                rec = cv2.resize(rec_small, orig_wh, interpolation=cv2.INTER_CUBIC)
+                            else:
+                                rec = rec_small
                             tag = f"rl_L{ln}_A{int(ang)}_I{args.deblur_iters}"
                         sc = focus_score(rec)
                         candidates.append((tag, rec, sc))
             else:
                 psf = motion_psf(int(args.deblur_len), float(args.deblur_angle))
+                # Optional temporary downscale for speed
+                deblur_src = proc
+                orig_wh = (proc.shape[1], proc.shape[0])
+                if args.deblur_max_width and proc.shape[1] > int(args.deblur_max_width):
+                    scale = float(args.deblur_max_width) / float(proc.shape[1])
+                    new_wh = (int(proc.shape[1] * scale), int(proc.shape[0] * scale))
+                    deblur_src = cv2.resize(proc, new_wh, interpolation=cv2.INTER_AREA)
                 if args.deblur_type == "wiener":
-                    rec = wiener_deconv(proc, psf, K=float(args.deblur_k))
+                    rec_small = wiener_deconv(deblur_src, psf, K=float(args.deblur_k))
+                    rec = cv2.resize(rec_small, orig_wh, interpolation=cv2.INTER_CUBIC) if deblur_src is not proc else rec_small
                     candidates.append((f"wiener_L{args.deblur_len}_A{int(args.deblur_angle)}_K{args.deblur_k}", rec, focus_score(rec)))
                 else:
-                    rec = richardson_lucy(proc, psf, iterations=int(args.deblur_iters))
+                    rec_small = richardson_lucy(deblur_src, psf, iterations=int(args.deblur_iters))
+                    rec = cv2.resize(rec_small, orig_wh, interpolation=cv2.INTER_CUBIC) if deblur_src is not proc else rec_small
                     candidates.append((f"rl_L{args.deblur_len}_A{int(args.deblur_angle)}_I{args.deblur_iters}", rec, focus_score(rec)))
 
             # choose best by focus score, append to steps
             tag, best_rec, sc = max(candidates, key=lambda t: t[2])
             steps.append((f"35_deblur_{tag}", best_rec))
-            proc = best_rec
+
+            # If requested, apply edge-masked blending and continue with blended result
+            if args.deblur_mask:
+                M = edge_mask(
+                    pre_deblur,
+                    method=args.mask_method,
+                    canny_thr1=args.mask_canny_thr1,
+                    canny_thr2=args.mask_canny_thr2,
+                    dilate=args.mask_dilate,
+                    dilate_ksize=args.mask_dilate_ksize,
+                    feather=args.mask_feather,
+                    gamma_pow=args.mask_gamma,
+                    thresh=args.mask_thresh,
+                )
+                if args.mask_save:
+                    m_vis = (np.clip(M, 0.0, 1.0) * 255).astype(np.uint8)
+                    m_vis = cv2.cvtColor(m_vis, cv2.COLOR_GRAY2BGR)
+                    steps.append(("34_edge_mask", m_vis))
+                blended = mask_blend(pre_deblur, best_rec, M, strength=args.mask_strength)
+                steps.append((f"36_deblur_masked_{tag}", blended))
+                proc = blended
+            else:
+                proc = best_rec
         except Exception as e:
             print(f"[yellow]Deblur failed: {e}[/yellow]")
 

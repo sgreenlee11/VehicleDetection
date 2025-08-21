@@ -9,10 +9,14 @@ imgsz: 640            # YOLO inference image size
 classes: [2]      # COCO: car(2), bus(5), truck(7). Excludes motorcycle by default
 batch_size: 8
 tracking:
-  max_age: 15
-  n_init: 1
-  max_iou_distance: 0.7
-  max_cosine_distance: 0.2
+  # Increased to tolerate longer detection gaps (~2s at 30 processed FPS)
+  max_age: 60
+  # Require two consecutive hits before confirming a track to avoid spurious IDs
+  n_init: 2
+  # Slightly relaxed to help re-associate after motion/scale changes
+  max_iou_distance: 0.8
+  # Slightly relaxed to rely more on appearance for continuity
+  max_cosine_distance: 0.3
   nn_budget: 100
 color_filter:
   mode: hsv
@@ -43,3 +47,7 @@ stills:
   edge_margin: 8          # Pixels from edge considered incomplete
   out_dirname: stills     # Subdirectory name for stills
   global_dir: all_stills
+  # Ordering and naming options for easier chronological review
+  sort_by_frame: true           # Save/export stills sorted by frame index (chronological)
+  filename_prefix_frame: true   # Prefix filenames with frame index so name-sort is chronological
+  write_index_csv: true         # Write a stills_index.csv sorted by frame
