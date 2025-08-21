@@ -28,7 +28,7 @@ def collect_videos(path: str, recurse: bool = True) -> List[str]:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Detect and export segments containing white vehicles (optionally sedans).")
+    ap = argparse.ArgumentParser(description="Detect and export stills of white vehicles (optionally sedans).")
     ap.add_argument("--input", required=True, help="Video file or directory")
     ap.add_argument("--output", default="outputs", help="Output directory")
     ap.add_argument("--model", default=None, help="YOLO model path, overrides config")
@@ -51,6 +51,15 @@ def main():
     ap.add_argument("--color-debug-dir", default=None, help="Directory to dump rejected crops/masks for tuning")
     ap.add_argument("--color-debug-max", type=int, default=None, help="Max rejected samples to save")
     ap.add_argument("--report", default="summary.csv", help="CSV filename under output for overall report")
+    # Re-ID post-filter options
+    ap.add_argument("--reid-enabled", type=lambda x: str(x).lower() in {"1","true","yes"}, default=None, help="Enable re-ID post-filter")
+    ap.add_argument("--reid-gallery", default=None, help="Path to gallery images (png/jpg mix supported)")
+    ap.add_argument("--reid-threshold", type=float, default=None, help="Cosine similarity threshold (e.g., 0.88)")
+    ap.add_argument("--reid-arch", default=None, help="Embedding backbone: osnet_x1_0 (default) or resnet50")
+    ap.add_argument("--reid-weights", default=None, help="Optional weights path matching arch")
+    ap.add_argument("--reid-size", type=int, default=None, help="Embedding input size (default 256)")
+    ap.add_argument("--reid-batch", type=int, default=None, help="Batch size for embedding (default 64)")
+    ap.add_argument("--reid-device", default=None, help="Device for embedding: auto/cpu/cuda/0/1...")
     args = ap.parse_args()
 
     analyzer = VideoAnalyzer(config_path=args.config)
@@ -123,6 +132,35 @@ def main():
     if args.color_debug_max is not None:
         analyzer.cfg.setdefault("color_filter", {})["debug_max"] = int(args.color_debug_max)
 
+    # Re-ID post-filter overrides
+    if any([
+        args.reid_enabled is not None,
+        args.reid_gallery is not None,
+        args.reid_threshold is not None,
+        args.reid_arch is not None,
+        args.reid_weights is not None,
+        args.reid_size is not None,
+        args.reid_batch is not None,
+        args.reid_device is not None,
+    ]):
+        rf = analyzer.cfg.setdefault("reid_filter", {})
+        if args.reid_enabled is not None:
+            rf["enabled"] = bool(args.reid_enabled)
+        if args.reid_gallery is not None:
+            rf["gallery_dir"] = str(args.reid_gallery)
+        if args.reid_threshold is not None:
+            rf["threshold"] = float(args.reid_threshold)
+        if args.reid_arch is not None:
+            rf["arch"] = str(args.reid_arch)
+        if args.reid_weights is not None:
+            rf["weights"] = str(args.reid_weights)
+        if args.reid_size is not None:
+            rf["size"] = int(args.reid_size)
+        if args.reid_batch is not None:
+            rf["batch"] = int(args.reid_batch)
+        if args.reid_device is not None:
+            rf["device"] = str(args.reid_device)
+
     videos = collect_videos(args.input, recurse=True)
     Path(args.output).mkdir(parents=True, exist_ok=True)
 
@@ -135,12 +173,13 @@ def main():
             out_json = Path(args.output) / Path(v).stem / "result.json"
             out_json.parent.mkdir(parents=True, exist_ok=True)
             out_json.write_text(json.dumps(res, indent=2))
-            # Add summary rows for exported segments
-            for seg in res.get("segments", []):
-                summary_rows.append({
-                    "video": v,
-                    **seg,
-                })
+            # Summary is currently focused on per-video runtime and stills count
+            summary_rows.append({
+                "video": v,
+                "runtime_sec": res.get("runtime_sec"),
+                "frames": res.get("frames"),
+                "stills_count": len(res.get("stills", [])),
+            })
             progress.advance(task, 1)
 
     # Write CSV summary

@@ -60,7 +60,6 @@ class VideoAnalyzer:
 
         # Behavior
         self.color_cfg = self.cfg.get("color_filter", {})
-        self.seg_cfg = self.cfg.get("segment_export", {})
         self.sedan_only = bool(self.cfg.get("sedan_only", False))
 
     def maybe_cap_fps(self, fps: float) -> int:
@@ -491,6 +490,5 @@ class VideoAnalyzer:
                 "tracks_confirmed_total": tracks_confirmed_total,
             },
             "detections": results,
-            "segments": [],
             "stills": still_records,
         }

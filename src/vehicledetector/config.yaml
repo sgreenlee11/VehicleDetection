@@ -44,13 +44,6 @@ color_filter:
   min_box_area: 1000     # Skip tiny boxes
   erosion: 1
 sedan_only: false        # If true, use heuristic shape ratio filter; proper classifier not bundled
-segment_export:
-  pre_seconds: 5
-  post_seconds: 5
-  codec: libx264
-  crf: 23
-  preset: veryfast
-  reencode: false   # If false, tries stream copy; falls back to reencode if not possible
 stills:
   enabled: true           # Export one representative still frame per matching track
   annotate: true          # Draw bbox and track id on the still frame

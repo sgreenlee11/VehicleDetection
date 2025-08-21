@@ -1,31 +1,34 @@
 # VehicleDetection Tool
 
-A Python pipeline to detect and extract video segments containing white sedans (or white vehicles) across large sets of videos using YOLOv8, DeepSORT, and ffmpeg.
+A Python pipeline to detect and export stills for white sedans (or white vehicles) across large sets of videos using YOLOv8 and DeepSORT, with optional re-ID high-confidence matching.
 
 ## Features
+
 - Aggressive frame sampling with configurable stride or FPS cap
 - YOLOv8 object detection (cars, trucks, buses, motorcycles)
 - DeepSORT multi-object tracking with robust scaling
 - Pearl-white color filter in Lab color space with adaptive thresholds
 - Optional sedan-only filtering (configurable; off by default)
-- Segment export: 5s before first detection to 5s after last detection per track using ffmpeg
+- Chronological, per-track best still export with optional crops and index CSV
+- Optional re-ID post-filter to copy high-confidence matches to a dedicated folder
 - CLI with batching over folders and CSV report output
 
 ## Install
 
 1. Create a virtual environment (optional but recommended):
+
 ```pwsh
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-2. Install dependencies:
+1. Install dependencies:
+
 ```pwsh
 pip install -r requirements.txt
 ```
 
-3. Ensure ffmpeg is installed and on PATH:
-- Windows: install from https://www.gyan.dev/ffmpeg/builds/ and add `ffmpeg.exe` to PATH.
+1. (Optional) If you plan to use TorchReID backends, install additional dependencies as noted in `requirements.txt`.
 
 ## Usage
 
@@ -41,8 +44,9 @@ python -m src.vehicledetector.cli `
 ```
 
 - Use `--input` to point to a file or directory (recurses by default).
-- Segments are written under `outputs/<video-stem>/segments/` with a CSV report.
+- Stills are written under `outputs/<video-stem>/stills/` (and `crops/` if enabled). If `reid_filter.enabled` is true, high-confidence matches will also be copied to `outputs/<video-stem>/reid_high_conf/` and optionally a global folder.
 
 ## Notes
-- Sedan-only requires a classifier or better model labels; by default we filter by COCO vehicle classes and color only.
+
+- Sedan-only is a heuristic on bbox shape; by default we filter by COCO vehicle classes and color only.
 - Color thresholds are tuned for pearl/ivory whites in typical daylight. Adjust in `config.yaml`.
