@@ -1,7 +1,7 @@
 from __future__ import annotations
 import cv2
 import numpy as np
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, List
 
 
 def crop_and_resize(frame: np.ndarray, bbox_xyxy: Tuple[int, int, int, int], max_side: int = 256) -> np.ndarray:
@@ -69,6 +69,48 @@ def white_mask_hsv(crop_bgr: np.ndarray, hsv_cfg: Dict[str, Any], erosion: int =
     return mask
 
 
+def _hue_union_mask(h_channel: np.ndarray, bands: List[Tuple[int, int]]) -> np.ndarray:
+    """Return a boolean mask where hue lies within any of the bands [lo, hi] inclusive.
+    h_channel: uint8 hue in [0,179]
+    bands: list of (lo, hi) with 0<=lo<=hi<=179
+    """
+    if not bands:
+        return np.zeros_like(h_channel, dtype=bool)
+    m = np.zeros_like(h_channel, dtype=bool)
+    for lo, hi in bands:
+        lo_i = max(0, int(lo)); hi_i = min(179, int(hi))
+        if hi_i >= lo_i:
+            m |= (h_channel >= lo_i) & (h_channel <= hi_i)
+    return m
+
+
+def hue_veto_colored_fraction(crop_bgr: np.ndarray, cfg: Dict[str, Any]) -> float:
+    """Compute the fraction of pixels that are strongly colored in specified hue bands.
+    cfg keys:
+      - s_min: int (default 80)
+      - v_min: int (default 80)
+      - bands: list of [lo, hi] hue intervals (default red+blue)
+    Returns: fraction in [0,1]
+    """
+    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+    H = hsv[..., 0]
+    S = hsv[..., 1]
+    V = hsv[..., 2]
+    s_min = int(cfg.get("s_min", 80))
+    v_min = int(cfg.get("v_min", 80))
+    bands = cfg.get("bands")
+    if not bands:
+        # default to common problem colors: red (two ranges) and blue
+        bands = [(0, 10), (170, 179), (100, 140)]
+    hue_m = _hue_union_mask(H, [(int(a), int(b)) for a, b in bands])
+    sat_m = S >= np.uint8(np.clip(s_min, 0, 255))
+    val_m = V >= np.uint8(np.clip(v_min, 0, 255))
+    colored = hue_m & sat_m & val_m
+    if colored.size == 0:
+        return 0.0
+    return float(colored.mean())
+
+
 def check_white(frame: np.ndarray, bbox_xyxy: Tuple[int, int, int, int], cfg: Dict[str, Any]) -> Tuple[bool, float, Optional[np.ndarray], Optional[np.ndarray]]:
     # Returns: (is_white, white_ratio, crop_bgr, mask)
     # Absolute minimum area in pixels and/or percentage of full frame area
@@ -87,6 +129,18 @@ def check_white(frame: np.ndarray, bbox_xyxy: Tuple[int, int, int, int], cfg: Di
     crop = crop_and_resize(frame, bbox_xyxy)
     if crop.size == 0:
         return False, 0.0, None, None
+
+    # Optional hue veto: if a significant fraction of pixels are strongly colored in specified hue bands, reject
+    veto_cfg = cfg.get("hue_veto", {}) or {}
+    if bool(veto_cfg.get("enabled", False)):
+        frac = hue_veto_colored_fraction(crop, veto_cfg)
+        veto_thr = float(veto_cfg.get("fraction", 0.2))
+        if frac >= veto_thr:
+            # Veto as not white due to dominant colored hues
+            # We still compute a white mask for debugging parity
+            mask = white_mask_hsv(crop, cfg.get("hsv", {}), erosion) if mode == "hsv" else white_mask_lab(crop, cfg.get("lab", {}), erosion)
+            white_ratio = float((mask > 0).mean()) if mask.size else 0.0
+            return False, white_ratio, crop, mask
 
     if mode == "hsv":
         mask = white_mask_hsv(crop, cfg.get("hsv", {}), erosion)

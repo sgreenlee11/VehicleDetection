@@ -12,6 +12,7 @@ import yaml
 from .detector import YoloDetector
 from .tracker import MultiObjectTracker
 from .color_utils import check_white
+from .reid_filter import score_against_gallery
 # Segment export removed per user request; keep module focused on stills only
 
 
@@ -399,6 +400,72 @@ class VideoAnalyzer:
                             ])
                 except Exception:
                     pass
+
+        # Optional re-ID post-filter: copy high-confidence stills to a separate folder
+        reid_cfg = self.cfg.get("reid_filter", {}) or {}
+        if bool(reid_cfg.get("enabled", False)) and still_records:
+            try:
+                gal_dir = reid_cfg.get("gallery_dir")
+                if gal_dir and str(gal_dir).strip():
+                    # choose which images to query: use crop if exists else full still
+                    query_paths = [r.get("crop") or r.get("image") for r in still_records]
+                    query_paths = [q for q in query_paths if q]
+                    # map query path back to still record for richer CSV
+                    rec_by_path = {}
+                    for r in still_records:
+                        qp = r.get("crop") or r.get("image")
+                        if qp:
+                            rec_by_path[os.path.abspath(qp)] = r
+                    scores = score_against_gallery(
+                        gallery_dir=str(gal_dir),
+                        query_paths=query_paths,
+                        arch=str(reid_cfg.get("arch", "osnet_x1_0")),
+                        weights=(reid_cfg.get("weights") or None),
+                        size=int(reid_cfg.get("size", 256)),
+                        batch=int(reid_cfg.get("batch", 64)),
+                        device=(None if reid_cfg.get("device", "auto") in (None, "auto") else str(reid_cfg.get("device"))),
+                    )
+                    thr = float(reid_cfg.get("threshold", 0.88))
+                    out_root = Path(output_dir) / Path(video_path).stem
+                    hc_dir = out_root / str(reid_cfg.get("out_dirname", "reid_high_conf"))
+                    hc_dir.mkdir(parents=True, exist_ok=True)
+                    # Optional global aggregate directory
+                    global_dir_name = reid_cfg.get("global_dir")
+                    global_hc_dir = None
+                    if global_dir_name:
+                        global_hc_dir = Path(output_dir) / str(global_dir_name)
+                        global_hc_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Build an index CSV
+                    import csv, shutil
+                    index_csv = hc_dir / "reid_high_conf.csv"
+                    with open(index_csv, "w", newline="", encoding="utf-8") as f:
+                        w = csv.writer(f)
+                        w.writerow(["frame", "track_id", "still_score", "orig_image", "orig_crop", "similarity", "best_gallery", "copied_path"])                        
+                        for qp, sc, gp in scores:
+                            if sc >= thr:
+                                src = Path(qp)
+                                dst = hc_dir / src.name
+                                try:
+                                    shutil.copy2(src, dst)
+                                    if global_hc_dir is not None:
+                                        shutil.copy2(src, global_hc_dir / (Path(video_path).stem + "_" + src.name))
+                                except Exception:
+                                    pass
+                                rec = rec_by_path.get(os.path.abspath(str(src)))
+                                w.writerow([
+                                    (rec.get("frame") if rec else ""),
+                                    (rec.get("track_id") if rec else ""),
+                                    (f"{rec.get('score', 0.0):.4f}" if rec else ""),
+                                    (rec.get("image") if rec else ""),
+                                    (rec.get("crop") if rec else ""),
+                                    f"{sc:.4f}",
+                                    gp or "",
+                                    str(dst),
+                                ])
+            except Exception:
+                # Post-filter is optional; ignore errors to avoid blocking main results
+                pass
 
         runtime = time.time() - start_time
         # Try to get YOLO device string

@@ -20,8 +20,19 @@ tracking:
   nn_budget: 100
 color_filter:
   mode: hsv
-  white_ratio_threshold: 0.15
+  white_ratio_threshold: 0.25
   enabled: true
+  # Optional: exclude clearly colored vehicles even if they have strong specular highlights
+  hue_veto:
+    enabled: true
+    fraction: 0.2       # if >= 20% of pixels are strongly colored in the bands below, reject as non-white
+    s_min: 80           # saturation threshold to consider a pixel strongly colored
+    v_min: 80           # value threshold to avoid dark noise
+    # Default hue bands: red (two ranges to wrap around), blue
+    bands:
+      - [0, 10]
+      - [170, 179]
+      - [100, 140]
   # Pearl white range in Lab space; tweak as needed
   lab:
     L_min: 70
@@ -31,7 +42,7 @@ color_filter:
     b_min: -5
     b_max: 15
   min_box_area: 1000     # Skip tiny boxes
-  erosion: 0
+  erosion: 1
 sedan_only: false        # If true, use heuristic shape ratio filter; proper classifier not bundled
 segment_export:
   pre_seconds: 5
@@ -51,3 +62,14 @@ stills:
   sort_by_frame: true           # Save/export stills sorted by frame index (chronological)
   filename_prefix_frame: true   # Prefix filenames with frame index so name-sort is chronological
   write_index_csv: true         # Write a stills_index.csv sorted by frame
+reid_filter:
+  enabled: false                 # When true, copy high-confidence stills into a separate folder
+  gallery_dir: ""               # Path to your target gallery images (5-10 best views)
+  threshold: 0.88                # Cosine similarity threshold to consider a match
+  arch: osnet_x1_0               # Backbone arch for embeddings; falls back to resnet50 if TorchReID missing
+  weights: ""                   # Optional path to trained weights matching arch
+  size: 256
+  batch: 64
+  device: auto                  # 'cuda', 'cpu', or 'auto'
+  out_dirname: reid_high_conf   # Subfolder under video output to copy high-confidence stills
+  global_dir: all_reid_high     # Optional flat global folder under output to aggregate matches
